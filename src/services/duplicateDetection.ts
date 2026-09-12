@@ -9,6 +9,9 @@ const LISTING_MATCH_RATIO = 0.8
 const FETCH_CONCURRENCY = Math.max(4, os.cpus().length * 2)
 const PAIR_CONCURRENCY = Math.max(4, os.cpus().length)
 
+const BROWSER_UA =
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+
 export type DuplicateJobStatus = 'idle' | 'running' | 'completed' | 'failed'
 
 export interface DuplicateJobProgress {
@@ -27,6 +30,10 @@ export interface DuplicateJobState {
   pairsFound?: number
   listingsCompared?: number
   listingsEligible?: number
+  listingsWithHashes?: number
+  imagesHashed?: number
+  imagesFetched?: number
+  imagesFailed?: number
 }
 
 interface ListingRow {
@@ -58,6 +65,10 @@ export function startDuplicateDetection(): { started: boolean; state: DuplicateJ
   jobState.pairsFound = undefined
   jobState.listingsCompared = undefined
   jobState.listingsEligible = undefined
+  jobState.listingsWithHashes = undefined
+  jobState.imagesHashed = undefined
+  jobState.imagesFetched = undefined
+  jobState.imagesFailed = undefined
   jobState.progress = {
     phase: 'hashing',
     current: 0,
@@ -75,14 +86,26 @@ export function startDuplicateDetection(): { started: boolean; state: DuplicateJ
   return { started: true, state: getDuplicateJobState() }
 }
 
-async function fetchImageBuffer(url: string): Promise<Buffer | null> {
+function normalizeFetchUrl(url: string): string {
+  const trimmed = url.trim()
+  if (trimmed.startsWith('//')) return `https:${trimmed}`
+  if (trimmed.startsWith('http')) return trimmed
+  return `https://www.list.am${trimmed.startsWith('/') ? trimmed : `/${trimmed}`}`
+}
+
+async function fetchImageBuffer(url: string, listingId: string): Promise<Buffer | null> {
+  const target = normalizeFetchUrl(url)
   try {
-    const res = await fetch(url, {
+    const res = await fetch(target, {
       headers: {
-        'User-Agent': 'Mozilla/5.0 (compatible; listam-backend/1.0)',
-        Referer: 'https://www.list.am/',
+        'User-Agent': BROWSER_UA,
+        Accept: 'image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8',
+        'Accept-Language': 'hy-AM,hy;q=0.9,en-US;q=0.8,en;q=0.7',
+        Referer: `https://www.list.am/item/${listingId}`,
+        Origin: 'https://www.list.am',
       },
-      signal: AbortSignal.timeout(20_000),
+      signal: AbortSignal.timeout(25_000),
+      redirect: 'follow',
     })
     if (!res.ok) return null
     const buf = Buffer.from(await res.arrayBuffer())
@@ -190,64 +213,109 @@ async function loadListings(): Promise<ListingRow[]> {
     .filter((row) => row.imageUrls.length > 0)
 }
 
-async function hashListingImages(
+async function upsertImageHash(listingId: string, imageUrl: string, phash: string): Promise<void> {
+  await pool.query(
+    `INSERT INTO listing_image_hashes (listing_id, image_url, phash)
+     VALUES ($1, $2, $3)
+     ON CONFLICT (listing_id, image_url) DO UPDATE SET phash = EXCLUDED.phash`,
+    [listingId, imageUrl, phash],
+  )
+}
+
+async function ensureImageHashes(
   listings: ListingRow[],
-  onProgress: (current: number, total: number) => void,
-): Promise<Map<string, string[]>> {
-  const uniqueUrls = [...new Set(listings.flatMap((l) => l.imageUrls))]
-  const urlToHash = new Map<string, string | null>()
+  onProgress: (current: number, total: number, fetched: number, failed: number) => void,
+): Promise<{
+  listingHashes: Map<string, string[]>
+  imagesHashed: number
+  imagesFetched: number
+  imagesFailed: number
+}> {
+  const urlToListingId = new Map<string, string>()
+  for (const listing of listings) {
+    for (const url of listing.imageUrls) {
+      if (!urlToListingId.has(url)) urlToListingId.set(url, listing.id)
+    }
+  }
+
+  const uniqueUrls = [...urlToListingId.keys()]
+  const urlToHash = new Map<string, string>()
+
+  if (uniqueUrls.length > 0) {
+    const { rows } = await pool.query<{ image_url: string; phash: string }>(
+      `SELECT image_url, phash FROM listing_image_hashes WHERE image_url = ANY($1::text[])`,
+      [uniqueUrls],
+    )
+    for (const row of rows) {
+      urlToHash.set(row.image_url, row.phash)
+    }
+  }
+
+  const cached = urlToHash.size
+  const toFetch = uniqueUrls.filter((url) => !urlToHash.has(url))
+  let imagesFetched = 0
+  let imagesFailed = 0
   let done = 0
 
-  await mapPool(uniqueUrls, FETCH_CONCURRENCY, async (url) => {
-    const buffer = await fetchImageBuffer(url)
-    let hash: string | null = null
+  onProgress(cached, uniqueUrls.length, 0, 0)
+
+  await mapPool(toFetch, FETCH_CONCURRENCY, async (url) => {
+    const listingId = urlToListingId.get(url)!
+    const buffer = await fetchImageBuffer(url, listingId)
     if (buffer) {
       try {
-        hash = await computePHash(buffer)
+        const phash = await computePHash(buffer)
+        urlToHash.set(url, phash)
+        await upsertImageHash(listingId, url, phash)
+        imagesFetched++
       } catch {
-        hash = null
+        imagesFailed++
       }
+    } else {
+      imagesFailed++
     }
-    urlToHash.set(url, hash)
     done++
-    onProgress(done, uniqueUrls.length)
+    onProgress(cached + done, uniqueUrls.length, imagesFetched, imagesFailed)
   })
 
   const listingHashes = new Map<string, string[]>()
-  const hashRows: { listingId: string; imageUrl: string; phash: string }[] = []
-
   for (const listing of listings) {
     const hashes: string[] = []
     for (const url of listing.imageUrls) {
       const hash = urlToHash.get(url)
-      if (hash) {
-        hashes.push(hash)
-        hashRows.push({ listingId: listing.id, imageUrl: url, phash: hash })
-      }
+      if (hash) hashes.push(hash)
     }
     if (hashes.length > 0) listingHashes.set(listing.id, hashes)
   }
 
-  await pool.query('DELETE FROM listing_image_hashes')
-  if (hashRows.length > 0) {
-    const values: unknown[] = []
-    const placeholders = hashRows
-      .map((row, i) => {
-        const base = i * 3
-        values.push(row.listingId, row.imageUrl, row.phash)
-        return `($${base + 1}, $${base + 2}, $${base + 3})`
-      })
-      .join(', ')
-    await pool.query(
-      `INSERT INTO listing_image_hashes (listing_id, image_url, phash) VALUES ${placeholders}`,
-      values,
-    )
+  return {
+    listingHashes,
+    imagesHashed: urlToHash.size,
+    imagesFetched,
+    imagesFailed,
   }
-
-  return listingHashes
 }
 
-function buildPairCandidates(listings: ListingRow[]): PairCandidate[] {
+function buildAllPairCandidates(listings: ListingRow[]): PairCandidate[] {
+  const pairs: PairCandidate[] = []
+  const seen = new Set<string>()
+
+  for (let i = 0; i < listings.length; i++) {
+    for (let j = i + 1; j < listings.length; j++) {
+      const a = listings[i]
+      const b = listings[j]
+      if (!a.ownerId || !b.ownerId || a.ownerId === b.ownerId) continue
+      const pairKey = a.id < b.id ? `${a.id}__${b.id}` : `${b.id}__${a.id}`
+      if (seen.has(pairKey)) continue
+      seen.add(pairKey)
+      pairs.push({ a, b })
+    }
+  }
+
+  return pairs
+}
+
+function buildUrlPairCandidates(listings: ListingRow[]): PairCandidate[] {
   const listingById = new Map(listings.map((listing) => [listing.id, listing]))
   const keyToListingIds = new Map<string, Set<string>>()
 
@@ -280,6 +348,21 @@ function buildPairCandidates(listings: ListingRow[]): PairCandidate[] {
   return pairs
 }
 
+function mergePairCandidates(...groups: PairCandidate[][]): PairCandidate[] {
+  const seen = new Set<string>()
+  const pairs: PairCandidate[] = []
+  for (const group of groups) {
+    for (const pair of group) {
+      const pairKey =
+        pair.a.id < pair.b.id ? `${pair.a.id}__${pair.b.id}` : `${pair.b.id}__${pair.a.id}`
+      if (seen.has(pairKey)) continue
+      seen.add(pairKey)
+      pairs.push(pair)
+    }
+  }
+  return pairs
+}
+
 async function runDuplicateDetection(): Promise<void> {
   const listings = await loadListings()
   jobState.listingsEligible = listings.length
@@ -302,28 +385,28 @@ async function runDuplicateDetection(): Promise<void> {
     return
   }
 
-  const listingHashes = new Map<string, string[]>()
-  const uniqueUrls = [...new Set(listings.flatMap((l) => l.imageUrls))]
-  if (uniqueUrls.length > 0) {
+  const hashResult = await ensureImageHashes(listings, (current, total, fetched, failed) => {
+    jobState.imagesFetched = fetched
+    jobState.imagesFailed = failed
     jobState.progress = {
       phase: 'hashing',
-      current: 0,
-      total: uniqueUrls.length,
-      message: `Optional pHash pass (${uniqueUrls.length} images)…`,
+      current,
+      total,
+      message: `Fetching/hashing images (${current}/${total})…`,
     }
-    const hashed = await hashListingImages(listings, (current, total) => {
-      jobState.progress = {
-        phase: 'hashing',
-        current,
-        total,
-        message: `Optional pHash pass (${current}/${total})…`,
-      }
-    })
-    for (const [id, hashes] of hashed) listingHashes.set(id, hashes)
-  }
+  })
 
-  const eligible = listings
-  const pairs = buildPairCandidates(eligible)
+  const listingHashes = hashResult.listingHashes
+  jobState.imagesHashed = hashResult.imagesHashed
+  jobState.imagesFetched = hashResult.imagesFetched
+  jobState.imagesFailed = hashResult.imagesFailed
+  jobState.listingsWithHashes = listings.filter((l) => listingHashes.has(l.id)).length
+
+  const listingsWithHashes = listings.filter((l) => listingHashes.has(l.id))
+  const urlPairs = buildUrlPairCandidates(listings)
+  const phashPairs =
+    listingsWithHashes.length >= 2 ? buildAllPairCandidates(listingsWithHashes) : []
+  const pairs = mergePairCandidates(urlPairs, phashPairs)
 
   jobState.progress = {
     phase: 'comparing',
@@ -396,11 +479,21 @@ async function runDuplicateDetection(): Promise<void> {
   jobState.status = 'completed'
   jobState.finishedAt = Date.now()
   jobState.pairsFound = matches.length
-  jobState.listingsCompared = eligible.length
+  jobState.listingsCompared = listings.length
+
+  const failNote =
+    (jobState.imagesFailed ?? 0) > 0
+      ? ` · ${jobState.imagesFailed} image fetch${jobState.imagesFailed === 1 ? '' : 'es'} failed`
+      : ''
+  const hashNote =
+    (jobState.listingsWithHashes ?? 0) === 0
+      ? ' · no images could be hashed (list.am may block server fetches)'
+      : ''
+
   jobState.progress = {
     phase: 'saving',
     current: 1,
     total: 1,
-    message: `Done — ${matches.length} duplicate pair${matches.length === 1 ? '' : 's'} found`,
+    message: `Done — ${matches.length} duplicate pair${matches.length === 1 ? '' : 's'} found${failNote}${hashNote}`,
   }
 }
