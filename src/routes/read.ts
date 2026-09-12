@@ -3,39 +3,57 @@ import { pool } from '../db.js'
 
 export const readRouter = Router()
 
+function asNumber(value: unknown): number | undefined {
+  if (value == null || value === '') return undefined
+  const n = Number(value)
+  return Number.isFinite(n) ? n : undefined
+}
+
+function asJson<T>(value: unknown): T | undefined {
+  if (value == null) return undefined
+  if (typeof value === 'string') {
+    try {
+      return JSON.parse(value) as T
+    } catch {
+      return undefined
+    }
+  }
+  return value as T
+}
+
 function rowToListing(row: Record<string, unknown>) {
   return {
     id: row.id,
     url: row.url,
     ownerId: row.owner_id ?? undefined,
     title: row.title ?? undefined,
-    price: row.price ?? undefined,
+    price: asNumber(row.price),
     currency: row.currency ?? undefined,
     isMonthly: row.is_monthly ?? undefined,
     thumbnailUrl: row.thumbnail_url ?? undefined,
     street: row.street ?? undefined,
     district: row.district ?? undefined,
-    rooms: row.rooms ?? undefined,
-    areaSqm: row.area_sqm ?? undefined,
-    currentFloor: row.current_floor ?? undefined,
-    totalFloors: row.total_floors ?? undefined,
-    badges: row.badges ?? undefined,
+    rooms: asNumber(row.rooms),
+    areaSqm: asNumber(row.area_sqm),
+    currentFloor: asNumber(row.current_floor),
+    totalFloors: asNumber(row.total_floors),
+    badges: asJson(row.badges),
     verificationStatus: row.verification_status ?? undefined,
     description: row.description ?? undefined,
-    imageUrls: row.image_urls ?? undefined,
-    attributes: row.attributes ?? undefined,
-    sourcePriceHistory: row.source_price_history ?? undefined,
-    postedAt: row.posted_at ?? undefined,
-    renewedAt: row.renewed_at ?? undefined,
-    firstSeenAt: row.first_seen_at,
-    lastSeenAt: row.last_seen_at,
-    lastChangedAt: row.last_changed_at,
+    imageUrls: asJson<string[]>(row.image_urls),
+    attributes: asJson<Record<string, string>>(row.attributes),
+    sourcePriceHistory: asJson(row.source_price_history),
+    postedAt: asNumber(row.posted_at),
+    renewedAt: asNumber(row.renewed_at),
+    firstSeenAt: asNumber(row.first_seen_at) ?? 0,
+    lastSeenAt: asNumber(row.last_seen_at) ?? 0,
+    lastChangedAt: asNumber(row.last_changed_at) ?? 0,
     enrichmentStatus: row.enrichment_status,
     enrichmentError: row.enrichment_error ?? undefined,
     isRemoved: row.is_removed ?? false,
-    removedAt: row.removed_at ?? undefined,
-    cardExtras: row.card_extras ?? undefined,
-    detailExtras: row.detail_extras ?? undefined,
+    removedAt: asNumber(row.removed_at),
+    cardExtras: asJson(row.card_extras),
+    detailExtras: asJson(row.detail_extras),
   }
 }
 
@@ -51,12 +69,12 @@ function rowToOwner(row: Record<string, unknown>) {
     tenureText: row.tenure_text ?? undefined,
     description: row.description ?? undefined,
     reviewsUrl: row.reviews_url ?? undefined,
-    sitePostsCount: row.site_posts_count ?? undefined,
-    scrapedPostsCount: row.scraped_posts_count ?? undefined,
-    ownerExtras: row.owner_extras ?? undefined,
-    firstSeenAt: row.first_seen_at,
-    lastSeenAt: row.last_seen_at,
-    lastChangedAt: row.last_changed_at,
+    sitePostsCount: asNumber(row.site_posts_count),
+    scrapedPostsCount: asNumber(row.scraped_posts_count),
+    ownerExtras: asJson(row.owner_extras),
+    firstSeenAt: asNumber(row.first_seen_at) ?? 0,
+    lastSeenAt: asNumber(row.last_seen_at) ?? 0,
+    lastChangedAt: asNumber(row.last_changed_at) ?? 0,
   }
 }
 
