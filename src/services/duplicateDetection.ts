@@ -92,24 +92,42 @@ async function fetchImageBuffer(url: string): Promise<Buffer | null> {
   }
 }
 
-function compareListingHashes(
-  hashesA: string[],
-  hashesB: string[],
+/** list.am uses /f/ and /g/ paths for the same underlying photo id. */
+export function normalizeImageUrlKey(url: string): string {
+  const trimmed = url.trim().toLowerCase()
+  const idMatch = trimmed.match(/(\d{6,})\.(?:jpe?g|png|webp|gif)/i)
+  if (idMatch) return idMatch[1]
+  try {
+    const path = new URL(trimmed.startsWith('//') ? `https:${trimmed}` : trimmed).pathname
+    return path.replace(/\/+/g, '/')
+  } catch {
+    return trimmed
+  }
+}
+
+function imageKeys(urls: string[]): string[] {
+  return urls.map(normalizeImageUrlKey).filter((key) => key.length > 0)
+}
+
+function compareImageSets(
+  keysA: string[],
+  keysB: string[],
+  score: (left: string, right: string) => number,
 ): { match: boolean; matchRatio: number; avgSimilarity: number } {
-  if (hashesA.length === 0 || hashesB.length === 0) {
+  if (keysA.length === 0 || keysB.length === 0) {
     return { match: false, matchRatio: 0, avgSimilarity: 0 }
   }
 
-  const smaller = hashesA.length <= hashesB.length ? hashesA : hashesB
-  const larger = hashesA.length <= hashesB.length ? hashesB : hashesA
+  const smaller = keysA.length <= keysB.length ? keysA : keysB
+  const larger = keysA.length <= keysB.length ? keysB : keysA
 
   let matched = 0
   let simSum = 0
 
-  for (const hash of smaller) {
+  for (const key of smaller) {
     let best = 0
     for (const other of larger) {
-      const sim = hashSimilarity(hash, other)
+      const sim = score(key, other)
       if (sim > best) best = sim
     }
     if (best >= IMAGE_MATCH_THRESHOLD) {
@@ -126,6 +144,28 @@ function compareListingHashes(
     matchRatio: Math.round(matchRatio * 1000) / 1000,
     avgSimilarity: Math.round(avgSimilarity * 1000) / 1000,
   }
+}
+
+function compareListingUrls(urlsA: string[], urlsB: string[]) {
+  return compareImageSets(imageKeys(urlsA), imageKeys(urlsB), (a, b) => (a === b ? 1 : 0))
+}
+
+function compareListingHashes(hashesA: string[], hashesB: string[]) {
+  return compareImageSets(hashesA, hashesB, hashSimilarity)
+}
+
+function compareListings(
+  urlsA: string[],
+  urlsB: string[],
+  hashesA: string[],
+  hashesB: string[],
+) {
+  const byUrl = compareListingUrls(urlsA, urlsB)
+  if (byUrl.match) return byUrl
+  if (hashesA.length > 0 && hashesB.length > 0) {
+    return compareListingHashes(hashesA, hashesB)
+  }
+  return byUrl
 }
 
 function canonicalPairId(a: string, b: string): { id: string; listingIdA: string; listingIdB: string } {
@@ -208,16 +248,35 @@ async function hashListingImages(
 }
 
 function buildPairCandidates(listings: ListingRow[]): PairCandidate[] {
-  const pairs: PairCandidate[] = []
-  for (let i = 0; i < listings.length; i++) {
-    for (let j = i + 1; j < listings.length; j++) {
-      const a = listings[i]
-      const b = listings[j]
-      if (!a.ownerId || !b.ownerId) continue
-      if (a.ownerId === b.ownerId) continue
-      pairs.push({ a, b })
+  const listingById = new Map(listings.map((listing) => [listing.id, listing]))
+  const keyToListingIds = new Map<string, Set<string>>()
+
+  for (const listing of listings) {
+    for (const key of imageKeys(listing.imageUrls)) {
+      if (!keyToListingIds.has(key)) keyToListingIds.set(key, new Set())
+      keyToListingIds.get(key)!.add(listing.id)
     }
   }
+
+  const seen = new Set<string>()
+  const pairs: PairCandidate[] = []
+
+  for (const listingIds of keyToListingIds.values()) {
+    const ids = [...listingIds]
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const a = listingById.get(ids[i])
+        const b = listingById.get(ids[j])
+        if (!a || !b) continue
+        if (!a.ownerId || !b.ownerId || a.ownerId === b.ownerId) continue
+        const pairKey = a.id < b.id ? `${a.id}__${b.id}` : `${b.id}__${a.id}`
+        if (seen.has(pairKey)) continue
+        seen.add(pairKey)
+        pairs.push({ a, b })
+      }
+    }
+  }
+
   return pairs
 }
 
@@ -243,23 +302,27 @@ async function runDuplicateDetection(): Promise<void> {
     return
   }
 
-  jobState.progress = {
-    phase: 'hashing',
-    current: 0,
-    total: 0,
-    message: `Hashing images for ${listings.length} listings…`,
-  }
-
-  const listingHashes = await hashListingImages(listings, (current, total) => {
+  const listingHashes = new Map<string, string[]>()
+  const uniqueUrls = [...new Set(listings.flatMap((l) => l.imageUrls))]
+  if (uniqueUrls.length > 0) {
     jobState.progress = {
       phase: 'hashing',
-      current,
-      total,
-      message: `Hashing images (${current}/${total})…`,
+      current: 0,
+      total: uniqueUrls.length,
+      message: `Optional pHash pass (${uniqueUrls.length} images)…`,
     }
-  })
+    const hashed = await hashListingImages(listings, (current, total) => {
+      jobState.progress = {
+        phase: 'hashing',
+        current,
+        total,
+        message: `Optional pHash pass (${current}/${total})…`,
+      }
+    })
+    for (const [id, hashes] of hashed) listingHashes.set(id, hashes)
+  }
 
-  const eligible = listings.filter((l) => listingHashes.has(l.id))
+  const eligible = listings
   const pairs = buildPairCandidates(eligible)
 
   jobState.progress = {
@@ -280,7 +343,7 @@ async function runDuplicateDetection(): Promise<void> {
   await mapPool(pairs, PAIR_CONCURRENCY, async ({ a, b }) => {
     const hashesA = listingHashes.get(a.id) ?? []
     const hashesB = listingHashes.get(b.id) ?? []
-    const result = compareListingHashes(hashesA, hashesB)
+    const result = compareListings(a.imageUrls, b.imageUrls, hashesA, hashesB)
     compared++
     if (compared % 50 === 0 || compared === pairs.length) {
       jobState.progress = {
