@@ -116,3 +116,25 @@ CREATE INDEX IF NOT EXISTS idx_listings_district ON listings(district);
 CREATE INDEX IF NOT EXISTS idx_search_listings_search ON search_listings(search_id);
 CREATE INDEX IF NOT EXISTS idx_scrape_runs_search ON scrape_runs(search_id);
 CREATE INDEX IF NOT EXISTS idx_scrape_logs_run ON scrape_logs(run_id);
+
+CREATE TABLE IF NOT EXISTS listing_image_hashes (
+  listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+  image_url TEXT NOT NULL,
+  phash TEXT NOT NULL,
+  PRIMARY KEY (listing_id, image_url)
+);
+
+CREATE INDEX IF NOT EXISTS idx_listing_image_hashes_phash ON listing_image_hashes(phash);
+
+CREATE TABLE IF NOT EXISTS listing_duplicate_pairs (
+  id TEXT PRIMARY KEY,
+  listing_id_a TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+  listing_id_b TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
+  match_ratio DOUBLE PRECISION NOT NULL,
+  avg_similarity DOUBLE PRECISION NOT NULL,
+  compared_at BIGINT NOT NULL,
+  UNIQUE (listing_id_a, listing_id_b)
+);
+
+CREATE INDEX IF NOT EXISTS idx_duplicate_pairs_a ON listing_duplicate_pairs(listing_id_a);
+CREATE INDEX IF NOT EXISTS idx_duplicate_pairs_b ON listing_duplicate_pairs(listing_id_b);

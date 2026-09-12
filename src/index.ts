@@ -2,6 +2,7 @@ import 'dotenv/config'
 import cors from 'cors'
 import express from 'express'
 import { migrate, pool } from './db.js'
+import { duplicatesRouter } from './routes/duplicates.js'
 import { ingestRouter } from './routes/ingest.js'
 import { readRouter } from './routes/read.js'
 
@@ -18,6 +19,7 @@ app.get('/health', (_req, res) => {
 })
 
 app.use('/api/ingest', ingestRouter)
+app.use('/api', duplicatesRouter)
 app.use('/api', readRouter)
 
 async function start(): Promise<void> {
