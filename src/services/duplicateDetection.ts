@@ -1,5 +1,6 @@
 import os from 'node:os'
 import { pool } from '../db.js'
+import { parseJsonArray } from '../utils/json.js'
 import { hashSimilarity, computePHash } from './phash.js'
 import { mapPool } from './pool.js'
 
@@ -25,6 +26,7 @@ export interface DuplicateJobState {
   error?: string
   pairsFound?: number
   listingsCompared?: number
+  listingsEligible?: number
 }
 
 interface ListingRow {
@@ -55,6 +57,7 @@ export function startDuplicateDetection(): { started: boolean; state: DuplicateJ
   jobState.error = undefined
   jobState.pairsFound = undefined
   jobState.listingsCompared = undefined
+  jobState.listingsEligible = undefined
   jobState.progress = {
     phase: 'hashing',
     current: 0,
@@ -135,17 +138,14 @@ async function loadListings(): Promise<ListingRow[]> {
     `SELECT id, owner_id, image_urls FROM listings
      WHERE enrichment_status = 'complete'
        AND COALESCE(is_removed, false) = false
-       AND image_urls IS NOT NULL
-       AND jsonb_array_length(image_urls) > 0`,
+       AND image_urls IS NOT NULL`,
   )
 
   return rows
     .map((row) => ({
       id: row.id,
       ownerId: row.owner_id,
-      imageUrls: Array.isArray(row.image_urls)
-        ? (row.image_urls as string[]).filter((u) => typeof u === 'string' && u.length > 0)
-        : [],
+      imageUrls: parseJsonArray(row.image_urls),
     }))
     .filter((row) => row.imageUrls.length > 0)
 }
@@ -223,6 +223,8 @@ function buildPairCandidates(listings: ListingRow[]): PairCandidate[] {
 
 async function runDuplicateDetection(): Promise<void> {
   const listings = await loadListings()
+  jobState.listingsEligible = listings.length
+
   if (listings.length < 2) {
     await pool.query('DELETE FROM listing_duplicate_pairs')
     jobState.status = 'completed'
@@ -233,7 +235,10 @@ async function runDuplicateDetection(): Promise<void> {
       phase: 'saving',
       current: 1,
       total: 1,
-      message: 'No pairs to compare',
+      message:
+        listings.length === 0
+          ? 'No detail-analyzed listings with images found'
+          : 'Need at least 2 listings with images to compare',
     }
     return
   }
