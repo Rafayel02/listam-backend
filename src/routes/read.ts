@@ -1,5 +1,6 @@
 import { Router } from 'express'
 import { pool } from '../db.js'
+import { buildDailyHistory } from '../services/dailyHistory.js'
 
 export const readRouter = Router()
 
@@ -172,6 +173,13 @@ readRouter.get('/search-listings', async (req, res) => {
       isPresent: r.is_present,
     })),
   )
+})
+
+readRouter.get('/changes/history', async (req, res) => {
+  const days = Math.min(Math.max(Number(req.query.days ?? 14), 1), 90)
+  const days_data = await buildDailyHistory(days)
+  const totalEvents = days_data.reduce((sum, day) => sum + day.events.length, 0)
+  res.json({ days: days_data, totalEvents })
 })
 
 readRouter.get('/stats/overview', async (_req, res) => {

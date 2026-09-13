@@ -116,6 +116,8 @@ CREATE INDEX IF NOT EXISTS idx_listings_district ON listings(district);
 CREATE INDEX IF NOT EXISTS idx_search_listings_search ON search_listings(search_id);
 CREATE INDEX IF NOT EXISTS idx_scrape_runs_search ON scrape_runs(search_id);
 CREATE INDEX IF NOT EXISTS idx_scrape_logs_run ON scrape_logs(run_id);
+CREATE INDEX IF NOT EXISTS idx_listing_changes_changed_at ON listing_changes(changed_at);
+CREATE INDEX IF NOT EXISTS idx_listing_changes_listing ON listing_changes(listing_id);
 
 CREATE TABLE IF NOT EXISTS listing_image_hashes (
   listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
