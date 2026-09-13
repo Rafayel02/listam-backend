@@ -7,6 +7,7 @@ import {
   getOwnerDayEventsPage,
   HISTORY_PAGE_SIZE,
 } from '../services/dailyHistory.js'
+import { getReputationChangeCorrelation } from '../services/historyCorrelation.js'
 
 export const readRouter = Router()
 
@@ -179,6 +180,12 @@ readRouter.get('/search-listings', async (req, res) => {
       isPresent: r.is_present,
     })),
   )
+})
+
+readRouter.get('/changes/correlation', async (req, res) => {
+  const days = Math.min(Math.max(Number(req.query.days ?? 14), 1), 90)
+  const result = await getReputationChangeCorrelation(days)
+  res.json(result)
 })
 
 readRouter.get('/changes/history', async (req, res) => {

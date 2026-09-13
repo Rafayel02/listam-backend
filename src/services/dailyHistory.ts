@@ -437,6 +437,14 @@ async function buildOwnerSummaries(events: HistoryEvent[]): Promise<OwnerDaySumm
   )
 }
 
+export async function getOwnerActivitySummaries(
+  fromMs: number,
+  toMs?: number,
+): Promise<OwnerDaySummary[]> {
+  const events = await collectEvents(fromMs, toMs)
+  return buildOwnerSummaries(events)
+}
+
 export async function getDayOwnerSummaries(date: string): Promise<DayOwnersPage> {
   const { start, end } = dayBounds(date)
   const events = await collectEvents(start, end)
