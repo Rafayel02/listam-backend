@@ -58,6 +58,12 @@ export interface DayOwnersPage {
   label: string
   owners: OwnerDaySummary[]
   totalOwners: number
+  totalActions: number
+  actionOffset: number
+  actionLimit: number
+  nextActionOffset: number
+  hasMore: boolean
+  loadedActionCount: number
 }
 
 export interface OwnerDayEventsPage {
@@ -445,16 +451,128 @@ export async function getOwnerActivitySummaries(
   return buildOwnerSummaries(events)
 }
 
-export async function getDayOwnerSummaries(date: string): Promise<DayOwnersPage> {
+function snapActionOffsetToOwnerBoundary(
+  owners: OwnerDaySummary[],
+  actionOffset: number,
+): number {
+  let cursor = 0
+  for (const owner of owners) {
+    const end = cursor + owner.counts.total
+    if (actionOffset > cursor && actionOffset < end) {
+      return end
+    }
+    cursor = end
+  }
+  return actionOffset
+}
+
+function paginateOwnersByActionBudget(
+  owners: OwnerDaySummary[],
+  actionOffset: number,
+  actionLimit: number,
+): {
+  owners: OwnerDaySummary[]
+  nextActionOffset: number
+  loadedActionCount: number
+  hasMore: boolean
+} {
+  const totalActions = owners.reduce((sum, owner) => sum + owner.counts.total, 0)
+  const boundedOffset = Math.max(0, Math.min(actionOffset, totalActions))
+  const startOffset = snapActionOffsetToOwnerBoundary(owners, boundedOffset)
+
+  if (startOffset >= totalActions || owners.length === 0) {
+    return {
+      owners: [],
+      nextActionOffset: totalActions,
+      loadedActionCount: 0,
+      hasMore: false,
+    }
+  }
+
+  let cursor = 0
+  let ownerIndex = 0
+  while (ownerIndex < owners.length && cursor + owners[ownerIndex].counts.total <= startOffset) {
+    cursor += owners[ownerIndex].counts.total
+    ownerIndex++
+  }
+
+  const pageOwners: OwnerDaySummary[] = []
+  let budget = actionLimit
+  let loadedActionCount = 0
+
+  while (ownerIndex < owners.length && budget > 0) {
+    const owner = owners[ownerIndex]
+    const ownerTotal = owner.counts.total
+
+    if (pageOwners.length === 0 && ownerTotal > actionLimit) {
+      pageOwners.push(owner)
+      loadedActionCount = actionLimit
+      const nextActionOffset = Math.min(startOffset + actionLimit, totalActions)
+      return {
+        owners: pageOwners,
+        nextActionOffset,
+        loadedActionCount,
+        hasMore: nextActionOffset < totalActions,
+      }
+    }
+
+    if (ownerTotal <= budget) {
+      pageOwners.push(owner)
+      budget -= ownerTotal
+      loadedActionCount += ownerTotal
+      cursor += ownerTotal
+      ownerIndex++
+      continue
+    }
+
+    if (pageOwners.length === 0) {
+      pageOwners.push(owner)
+      loadedActionCount = actionLimit
+      const nextActionOffset = Math.min(startOffset + actionLimit, totalActions)
+      return {
+        owners: pageOwners,
+        nextActionOffset,
+        loadedActionCount,
+        hasMore: nextActionOffset < totalActions,
+      }
+    }
+
+    break
+  }
+
+  const nextActionOffset = snapActionOffsetToOwnerBoundary(owners, startOffset + loadedActionCount)
+  return {
+    owners: pageOwners,
+    nextActionOffset: Math.max(nextActionOffset, startOffset + loadedActionCount),
+    loadedActionCount,
+    hasMore: nextActionOffset < totalActions,
+  }
+}
+
+export async function getDayOwnerSummaries(
+  date: string,
+  actionOffset = 0,
+  actionLimit: number = HISTORY_PAGE_SIZE,
+): Promise<DayOwnersPage> {
+  const safeLimit = Math.min(Math.max(actionLimit, 1), 200)
   const { start, end } = dayBounds(date)
   const events = await collectEvents(start, end)
 
-  const owners = await buildOwnerSummaries(events)
+  const allOwners = await buildOwnerSummaries(events)
+  const totalActions = allOwners.reduce((sum, owner) => sum + owner.counts.total, 0)
+  const page = paginateOwnersByActionBudget(allOwners, actionOffset, safeLimit)
+
   return {
     date,
     label: dayLabel(date),
-    owners,
-    totalOwners: owners.length,
+    owners: page.owners,
+    totalOwners: allOwners.length,
+    totalActions,
+    actionOffset,
+    actionLimit: safeLimit,
+    nextActionOffset: page.nextActionOffset,
+    hasMore: page.hasMore,
+    loadedActionCount: page.loadedActionCount,
   }
 }
 

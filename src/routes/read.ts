@@ -194,7 +194,9 @@ readRouter.get('/changes/history', async (req, res) => {
   const ownerId = req.query.ownerId as string | undefined
 
   if (date && view === 'owners') {
-    const result = await getDayOwnerSummaries(date)
+    const actionOffset = Math.max(Number(req.query.actionOffset ?? 0), 0)
+    const actionLimit = Math.min(Math.max(Number(req.query.actionLimit ?? HISTORY_PAGE_SIZE), 1), 200)
+    const result = await getDayOwnerSummaries(date, actionOffset, actionLimit)
     res.json(result)
     return
   }
