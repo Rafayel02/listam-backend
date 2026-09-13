@@ -81,11 +81,40 @@ export interface OwnerDayEventsPage {
 
 export const UNKNOWN_OWNER_ID = '_unknown'
 
+export interface ReputationTierBreakdown {
+  tier: string
+  label: string
+  minScore: number | null
+  maxScore: number | null
+  ownerCount: number
+  counts: OwnerActionCounts
+}
+
+export interface DayActivitySummary {
+  totals: OwnerActionCounts
+  byReputation: ReputationTierBreakdown[]
+  ownerCount: number
+}
+
+export interface DayActivitySummaryPage {
+  date: string
+  label: string
+  summary: DayActivitySummary
+}
+
 export interface DaySummary {
   date: string
   label: string
   totalEvents: number
 }
+
+const REPUTATION_TIER_DEFINITIONS = [
+  { tier: 'high', label: 'High (80+)', minScore: 80, maxScore: 100 },
+  { tier: 'good', label: 'Good (60–79)', minScore: 60, maxScore: 79 },
+  { tier: 'moderate', label: 'Moderate (40–59)', minScore: 40, maxScore: 59 },
+  { tier: 'low', label: 'Low (<40)', minScore: 0, maxScore: 39 },
+  { tier: 'unknown', label: 'Unknown owner', minScore: null, maxScore: null },
+] as const
 
 export interface DayEventsPage {
   date: string
@@ -134,6 +163,60 @@ function emptyOwnerCounts(): OwnerActionCounts {
     location: 0,
     other: 0,
     total: 0,
+  }
+}
+
+function incrementActionCount(counts: OwnerActionCounts, action: OwnerActionCategory): void {
+  counts[action] += 1
+  counts.total += 1
+}
+
+function reputationTierForEvent(
+  ownerId?: string,
+  reputation?: OwnerReputation,
+): (typeof REPUTATION_TIER_DEFINITIONS)[number]['tier'] {
+  if (!ownerId || ownerId === UNKNOWN_OWNER_ID) return 'unknown'
+  const score = reputation?.score ?? 0
+  if (score >= 80) return 'high'
+  if (score >= 60) return 'good'
+  if (score >= 40) return 'moderate'
+  return 'low'
+}
+
+async function buildDayActivitySummary(events: HistoryEvent[]): Promise<DayActivitySummary> {
+  const ownerIds = [...new Set(events.map((event) => ownerKey(event.ownerId)))]
+  const reputationById = await fetchOwnerReputationMap(ownerIds)
+  const totals = emptyOwnerCounts()
+  const tierCounts = new Map<string, OwnerActionCounts>()
+  const tierOwners = new Map<string, Set<string>>()
+
+  for (const definition of REPUTATION_TIER_DEFINITIONS) {
+    tierCounts.set(definition.tier, emptyOwnerCounts())
+    tierOwners.set(definition.tier, new Set())
+  }
+
+  for (const event of events) {
+    const key = ownerKey(event.ownerId)
+    const reputation = reputationById.get(key)
+    const tier = reputationTierForEvent(event.ownerId, reputation)
+    incrementActionCount(totals, event.action)
+    incrementActionCount(tierCounts.get(tier)!, event.action)
+    tierOwners.get(tier)!.add(key)
+  }
+
+  const ownerCount = new Set(events.map((event) => ownerKey(event.ownerId))).size
+
+  return {
+    totals,
+    ownerCount,
+    byReputation: REPUTATION_TIER_DEFINITIONS.map((definition) => ({
+      tier: definition.tier,
+      label: definition.label,
+      minScore: definition.minScore,
+      maxScore: definition.maxScore,
+      ownerCount: tierOwners.get(definition.tier)!.size,
+      counts: tierCounts.get(definition.tier)!,
+    })),
   }
 }
 
@@ -546,6 +629,18 @@ function paginateOwnersByActionBudget(
     nextActionOffset: Math.max(nextActionOffset, startOffset + loadedActionCount),
     loadedActionCount,
     hasMore: nextActionOffset < totalActions,
+  }
+}
+
+export async function getDayActivitySummary(date: string): Promise<DayActivitySummaryPage> {
+  const { start, end } = dayBounds(date)
+  const events = await collectEvents(start, end)
+  const summary = await buildDayActivitySummary(events)
+
+  return {
+    date,
+    label: dayLabel(date),
+    summary,
   }
 }
 

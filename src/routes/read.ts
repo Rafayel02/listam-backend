@@ -1,6 +1,7 @@
 import { Router } from 'express'
 import { pool } from '../db.js'
 import {
+  getDayActivitySummary,
   getDayEventsPage,
   getDayOwnerSummaries,
   getDaySummaries,
@@ -192,6 +193,12 @@ readRouter.get('/changes/history', async (req, res) => {
   const date = req.query.date as string | undefined
   const view = req.query.view as string | undefined
   const ownerId = req.query.ownerId as string | undefined
+
+  if (date && view === 'summary') {
+    const result = await getDayActivitySummary(date)
+    res.json(result)
+    return
+  }
 
   if (date && view === 'owners') {
     const actionOffset = Math.max(Number(req.query.actionOffset ?? 0), 0)
