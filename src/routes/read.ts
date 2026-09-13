@@ -1,6 +1,12 @@
 import { Router } from 'express'
 import { pool } from '../db.js'
-import { getDayEventsPage, getDaySummaries, HISTORY_PAGE_SIZE } from '../services/dailyHistory.js'
+import {
+  getDayEventsPage,
+  getDayOwnerSummaries,
+  getDaySummaries,
+  getOwnerDayEventsPage,
+  HISTORY_PAGE_SIZE,
+} from '../services/dailyHistory.js'
 
 export const readRouter = Router()
 
@@ -177,6 +183,22 @@ readRouter.get('/search-listings', async (req, res) => {
 
 readRouter.get('/changes/history', async (req, res) => {
   const date = req.query.date as string | undefined
+  const view = req.query.view as string | undefined
+  const ownerId = req.query.ownerId as string | undefined
+
+  if (date && view === 'owners') {
+    const result = await getDayOwnerSummaries(date)
+    res.json(result)
+    return
+  }
+
+  if (date && ownerId) {
+    const page = Math.max(Number(req.query.page ?? 1), 1)
+    const limit = Math.min(Math.max(Number(req.query.limit ?? HISTORY_PAGE_SIZE), 1), 200)
+    const result = await getOwnerDayEventsPage(date, ownerId, page, limit)
+    res.json(result)
+    return
+  }
 
   if (date) {
     const page = Math.max(Number(req.query.page ?? 1), 1)

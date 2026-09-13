@@ -3,6 +3,28 @@ import { summarizeFieldChange, type FieldChange } from '../utils/changeFormat.js
 
 export type HistoryEventKind = 'added' | 'removed' | 'updated'
 
+export type OwnerActionCategory =
+  | 'added'
+  | 'removed'
+  | 'price'
+  | 'images'
+  | 'title'
+  | 'description'
+  | 'location'
+  | 'other'
+
+export interface OwnerActionCounts {
+  added: number
+  removed: number
+  price: number
+  images: number
+  title: number
+  description: number
+  location: number
+  other: number
+  total: number
+}
+
 export interface HistoryEvent {
   id: string
   kind: HistoryEventKind
@@ -10,9 +32,42 @@ export interface HistoryEvent {
   title?: string
   url: string
   summary: string
+  action: OwnerActionCategory
+  ownerId?: string
+  ownerName?: string
+  ownerProfileUrl?: string
   changedAt: number
   date: string
 }
+
+export interface OwnerDaySummary {
+  ownerId: string
+  ownerName?: string
+  ownerProfileUrl?: string
+  counts: OwnerActionCounts
+}
+
+export interface DayOwnersPage {
+  date: string
+  label: string
+  owners: OwnerDaySummary[]
+  totalOwners: number
+}
+
+export interface OwnerDayEventsPage {
+  date: string
+  label: string
+  ownerId: string
+  ownerName?: string
+  ownerProfileUrl?: string
+  events: HistoryEvent[]
+  page: number
+  limit: number
+  total: number
+  totalPages: number
+}
+
+export const UNKNOWN_OWNER_ID = '_unknown'
 
 export interface DaySummary {
   date: string
@@ -56,6 +111,46 @@ function eventId(parts: string[]): string {
   return parts.join(':')
 }
 
+function emptyOwnerCounts(): OwnerActionCounts {
+  return {
+    added: 0,
+    removed: 0,
+    price: 0,
+    images: 0,
+    title: 0,
+    description: 0,
+    location: 0,
+    other: 0,
+    total: 0,
+  }
+}
+
+export function categorizeEvent(
+  event: Pick<HistoryEvent, 'kind' | 'summary'>,
+): OwnerActionCategory {
+  if (event.kind === 'added') return 'added'
+  if (event.kind === 'removed') return 'removed'
+  const summary = event.summary.toLowerCase()
+  if (summary.includes('price')) return 'price'
+  if (summary.includes('images')) return 'images'
+  if (summary.includes('title')) return 'title'
+  if (summary.includes('description')) return 'description'
+  if (summary.includes('district') || summary.includes('street')) return 'location'
+  return 'other'
+}
+
+function ownerFields(row: {
+  owner_id: string | null
+  owner_name: string | null
+  owner_profile_url: string | null
+}) {
+  return {
+    ownerId: row.owner_id ?? undefined,
+    ownerName: row.owner_name ?? undefined,
+    ownerProfileUrl: row.owner_profile_url ?? undefined,
+  }
+}
+
 async function fetchChangeRows(fromMs: number, toMs?: number) {
   const params = toMs != null ? [fromMs, toMs] : [fromMs]
   const bound = toMs != null ? 'AND lc.changed_at <= $2' : ''
@@ -65,11 +160,16 @@ async function fetchChangeRows(fromMs: number, toMs?: number) {
     changes: FieldChange[]
     title: string | null
     url: string
+    owner_id: string | null
+    owner_name: string | null
+    owner_profile_url: string | null
   }>(
     `SELECT DISTINCT ON (lc.listing_id, lc.changed_at, lc.changes::text)
-            lc.listing_id, lc.changed_at, lc.changes, l.title, l.url
+            lc.listing_id, lc.changed_at, lc.changes, l.title, l.url,
+            l.owner_id, o.name AS owner_name, o.profile_url AS owner_profile_url
      FROM listing_changes lc
      JOIN listings l ON l.id = lc.listing_id
+     LEFT JOIN owners o ON o.id = l.owner_id
      WHERE lc.changed_at >= $1 ${bound}
      ORDER BY lc.listing_id, lc.changed_at, lc.changes::text, lc.id DESC`,
     params,
@@ -78,22 +178,42 @@ async function fetchChangeRows(fromMs: number, toMs?: number) {
 
 async function fetchAddedRows(fromMs: number, toMs?: number) {
   const params = toMs != null ? [fromMs, toMs] : [fromMs]
-  const bound = toMs != null ? 'AND first_seen_at <= $2' : ''
-  return pool.query<{ id: string; title: string | null; url: string; first_seen_at: string }>(
-    `SELECT id, title, url, first_seen_at
-     FROM listings
-     WHERE first_seen_at >= $1 ${bound}`,
+  const bound = toMs != null ? 'AND l.first_seen_at <= $2' : ''
+  return pool.query<{
+    id: string
+    title: string | null
+    url: string
+    first_seen_at: string
+    owner_id: string | null
+    owner_name: string | null
+    owner_profile_url: string | null
+  }>(
+    `SELECT l.id, l.title, l.url, l.first_seen_at,
+            l.owner_id, o.name AS owner_name, o.profile_url AS owner_profile_url
+     FROM listings l
+     LEFT JOIN owners o ON o.id = l.owner_id
+     WHERE l.first_seen_at >= $1 ${bound}`,
     params,
   )
 }
 
 async function fetchRemovedRows(fromMs: number, toMs?: number) {
   const params = toMs != null ? [fromMs, toMs] : [fromMs]
-  const bound = toMs != null ? 'AND removed_at <= $2' : ''
-  return pool.query<{ id: string; title: string | null; url: string; removed_at: string }>(
-    `SELECT id, title, url, removed_at
-     FROM listings
-     WHERE removed_at IS NOT NULL AND removed_at >= $1 ${bound}`,
+  const bound = toMs != null ? 'AND l.removed_at <= $2' : ''
+  return pool.query<{
+    id: string
+    title: string | null
+    url: string
+    removed_at: string
+    owner_id: string | null
+    owner_name: string | null
+    owner_profile_url: string | null
+  }>(
+    `SELECT l.id, l.title, l.url, l.removed_at,
+            l.owner_id, o.name AS owner_name, o.profile_url AS owner_profile_url
+     FROM listings l
+     LEFT JOIN owners o ON o.id = l.owner_id
+     WHERE l.removed_at IS NOT NULL AND l.removed_at >= $1 ${bound}`,
     params,
   )
 }
@@ -108,13 +228,16 @@ function buildEventsFromRows(
 
   for (const row of addedRows) {
     const changedAt = Number(row.first_seen_at)
+    const summary = 'added'
     events.push({
       id: eventId(['added', row.id, String(changedAt)]),
       kind: 'added',
       listingId: row.id,
       title: row.title ?? undefined,
       url: row.url,
-      summary: 'added',
+      summary,
+      action: 'added',
+      ...ownerFields(row),
       changedAt,
       date: dayKey(changedAt),
     })
@@ -131,6 +254,8 @@ function buildEventsFromRows(
       title: row.title ?? undefined,
       url: row.url,
       summary: 'removed',
+      action: 'removed',
+      ...ownerFields(row),
       changedAt,
       date,
     })
@@ -140,6 +265,7 @@ function buildEventsFromRows(
     const changedAt = Number(row.changed_at)
     const date = dayKey(changedAt)
     const changes = Array.isArray(row.changes) ? row.changes : []
+    const owners = ownerFields(row)
 
     for (const change of changes) {
       const summary = summarizeFieldChange(change)
@@ -156,22 +282,27 @@ function buildEventsFromRows(
           title: row.title ?? undefined,
           url: row.url,
           summary: 'removed',
+          action: 'removed',
+          ...owners,
           changedAt,
           date,
         })
         continue
       }
 
-      events.push({
+      const event: HistoryEvent = {
         id: eventId(['updated', row.listing_id, String(changedAt), change.field]),
         kind: 'updated',
         listingId: row.listing_id,
         title: row.title ?? undefined,
         url: row.url,
         summary,
+        action: categorizeEvent({ kind: 'updated', summary }),
+        ...owners,
         changedAt,
         date,
-      })
+      }
+      events.push(event)
     }
   }
 
@@ -211,6 +342,77 @@ export async function getDaySummaries(days: number): Promise<{
   return {
     days: daysList,
     totalEvents: events.length,
+  }
+}
+
+function ownerKey(ownerId?: string): string {
+  return ownerId ?? UNKNOWN_OWNER_ID
+}
+
+function buildOwnerSummaries(events: HistoryEvent[]): OwnerDaySummary[] {
+  const byOwner = new Map<string, OwnerDaySummary>()
+
+  for (const event of events) {
+    const key = ownerKey(event.ownerId)
+    let summary = byOwner.get(key)
+    if (!summary) {
+      summary = {
+        ownerId: key,
+        ownerName: event.ownerName,
+        ownerProfileUrl: event.ownerProfileUrl,
+        counts: emptyOwnerCounts(),
+      }
+      byOwner.set(key, summary)
+    }
+
+    summary.counts[event.action] += 1
+    summary.counts.total += 1
+  }
+
+  return [...byOwner.values()].sort((a, b) => b.counts.total - a.counts.total)
+}
+
+export async function getDayOwnerSummaries(date: string): Promise<DayOwnersPage> {
+  const { start, end } = dayBounds(date)
+  const events = await collectEvents(start, end)
+
+  const owners = buildOwnerSummaries(events)
+  return {
+    date,
+    label: dayLabel(date),
+    owners,
+    totalOwners: owners.length,
+  }
+}
+
+export async function getOwnerDayEventsPage(
+  date: string,
+  ownerId: string,
+  page: number,
+  limit: number = HISTORY_PAGE_SIZE,
+): Promise<OwnerDayEventsPage> {
+  const safeLimit = Math.min(Math.max(limit, 1), 200)
+  const safePage = Math.max(page, 1)
+  const { start, end } = dayBounds(date)
+
+  const allEvents = await collectEvents(start, end)
+  const events = allEvents.filter((event) => ownerKey(event.ownerId) === ownerId)
+  const total = events.length
+  const totalPages = Math.max(1, Math.ceil(total / safeLimit))
+  const offset = (safePage - 1) * safeLimit
+  const first = events[0]
+
+  return {
+    date,
+    label: dayLabel(date),
+    ownerId,
+    ownerName: first?.ownerName,
+    ownerProfileUrl: first?.ownerProfileUrl,
+    events: events.slice(offset, offset + safeLimit),
+    page: safePage,
+    limit: safeLimit,
+    total,
+    totalPages,
   }
 }
 
