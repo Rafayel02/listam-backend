@@ -1,5 +1,10 @@
 import { pool } from '../db.js'
 import { summarizeFieldChange, type FieldChange } from '../utils/changeFormat.js'
+import {
+  compareOwnerReputation,
+  computeOwnerReputation,
+  type OwnerReputation,
+} from '../utils/ownerReliability.js'
 
 export type HistoryEventKind = 'added' | 'removed' | 'updated'
 
@@ -44,6 +49,7 @@ export interface OwnerDaySummary {
   ownerId: string
   ownerName?: string
   ownerProfileUrl?: string
+  reputation: OwnerReputation
   counts: OwnerActionCounts
 }
 
@@ -349,7 +355,51 @@ function ownerKey(ownerId?: string): string {
   return ownerId ?? UNKNOWN_OWNER_ID
 }
 
-function buildOwnerSummaries(events: HistoryEvent[]): OwnerDaySummary[] {
+async function fetchOwnerReputationMap(ownerIds: string[]) {
+  const knownIds = ownerIds.filter((id) => id !== UNKNOWN_OWNER_ID)
+  const reputationById = new Map<string, OwnerReputation>()
+
+  if (knownIds.length === 0) return reputationById
+
+  const { rows } = await pool.query<{
+    id: string
+    rating: number | null
+    review_count: number | null
+    is_verified_company: boolean | null
+    site_posts_count: number | null
+    scraped_posts_count: string
+  }>(
+    `SELECT o.id, o.rating, o.review_count, o.is_verified_company, o.site_posts_count,
+            COUNT(l.id)::text AS scraped_posts_count
+     FROM owners o
+     LEFT JOIN listings l ON l.owner_id = o.id
+     WHERE o.id = ANY($1::text[])
+     GROUP BY o.id`,
+    [knownIds],
+  )
+
+  for (const row of rows) {
+    reputationById.set(
+      row.id,
+      computeOwnerReputation({
+        rating: row.rating,
+        reviewCount: row.review_count,
+        isVerifiedCompany: row.is_verified_company,
+        sitePostsCount: row.site_posts_count,
+        scrapedPostsCount: Number(row.scraped_posts_count),
+      }),
+    )
+  }
+
+  return reputationById
+}
+
+const UNKNOWN_OWNER_REPUTATION: OwnerReputation = {
+  score: 0,
+  label: 'Low data',
+}
+
+async function buildOwnerSummaries(events: HistoryEvent[]): Promise<OwnerDaySummary[]> {
   const byOwner = new Map<string, OwnerDaySummary>()
 
   for (const event of events) {
@@ -360,6 +410,7 @@ function buildOwnerSummaries(events: HistoryEvent[]): OwnerDaySummary[] {
         ownerId: key,
         ownerName: event.ownerName,
         ownerProfileUrl: event.ownerProfileUrl,
+        reputation: UNKNOWN_OWNER_REPUTATION,
         counts: emptyOwnerCounts(),
       }
       byOwner.set(key, summary)
@@ -369,14 +420,28 @@ function buildOwnerSummaries(events: HistoryEvent[]): OwnerDaySummary[] {
     summary.counts.total += 1
   }
 
-  return [...byOwner.values()].sort((a, b) => b.counts.total - a.counts.total)
+  const reputationById = await fetchOwnerReputationMap([...byOwner.keys()])
+  for (const summary of byOwner.values()) {
+    summary.reputation = reputationById.get(summary.ownerId) ?? UNKNOWN_OWNER_REPUTATION
+  }
+
+  return [...byOwner.values()].sort((a, b) =>
+    compareOwnerReputation(
+      a.reputation,
+      b.reputation,
+      a.reputation.rating ?? 0,
+      b.reputation.rating ?? 0,
+      a.reputation.reviewCount ?? 0,
+      b.reputation.reviewCount ?? 0,
+    ),
+  )
 }
 
 export async function getDayOwnerSummaries(date: string): Promise<DayOwnersPage> {
   const { start, end } = dayBounds(date)
   const events = await collectEvents(start, end)
 
-  const owners = buildOwnerSummaries(events)
+  const owners = await buildOwnerSummaries(events)
   return {
     date,
     label: dayLabel(date),
