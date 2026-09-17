@@ -413,117 +413,67 @@ async function collectEvents(fromMs: number, toMs?: number): Promise<HistoryEven
   return buildEventsFromRows(changeRows.rows, addedRows.rows, removedRows.rows)
 }
 
-const DAY_KEY_SQL = `to_char(to_timestamp(ms / 1000.0), 'YYYY-MM-DD')`
+function msToDayKey(column: string): string {
+  return `to_char(to_timestamp(${column} / 1000.0), 'YYYY-MM-DD')`
+}
 
-const DAY_SUMMARY_COUNTS_SQL = `
-WITH bounds AS (
-  SELECT $1::bigint AS from_ms
-),
-added AS (
-  SELECT ${DAY_KEY_SQL.replace('ms', 'l.first_seen_at')} AS day,
-         COUNT(*)::int AS cnt
-  FROM listings l
-  CROSS JOIN bounds b
-  WHERE l.first_seen_at >= b.from_ms
-  GROUP BY 1
-),
-removed_rows AS (
-  SELECT l.id AS listing_id,
-         ${DAY_KEY_SQL.replace('ms', 'l.removed_at')} AS day
-  FROM listings l
-  CROSS JOIN bounds b
-  WHERE l.removed_at IS NOT NULL
-    AND l.removed_at >= b.from_ms
-),
-removed AS (
-  SELECT day, COUNT(*)::int AS cnt
-  FROM removed_rows
-  GROUP BY day
-),
-deduped_changes AS (
-  SELECT DISTINCT ON (lc.listing_id, lc.changed_at, lc.changes::text)
-         lc.listing_id,
-         lc.changed_at,
-         lc.changes
-  FROM listing_changes lc
-  CROSS JOIN bounds b
-  WHERE lc.changed_at >= b.from_ms
-  ORDER BY lc.listing_id, lc.changed_at, lc.changes::text, lc.id DESC
-),
-expanded AS (
-  SELECT dc.listing_id,
-         ${DAY_KEY_SQL.replace('ms', 'dc.changed_at')} AS day,
-         elem AS change
-  FROM deduped_changes dc
-  CROSS JOIN LATERAL jsonb_array_elements(dc.changes) AS elem
-),
-classified AS (
-  SELECT e.day,
-         e.listing_id,
-         (
-           (e.change->>'field' = 'isRemoved' AND e.change->>'to' = 'true')
-           OR (e.change->>'field' = 'enrichmentStatus' AND e.change->>'to' = 'removed')
-         ) AS is_removal
-  FROM expanded e
-),
-change_removals AS (
-  SELECT DISTINCT ON (day, listing_id) day, listing_id
-  FROM classified
-  WHERE is_removal
-  ORDER BY day, listing_id
-),
-change_removal_counts AS (
-  SELECT cr.day, COUNT(*)::int AS cnt
-  FROM change_removals cr
-  WHERE NOT EXISTS (
-    SELECT 1
-    FROM removed_rows rr
-    WHERE rr.listing_id = cr.listing_id
-      AND rr.day = cr.day
-  )
-  GROUP BY cr.day
-),
-change_update_counts AS (
-  SELECT day, COUNT(*)::int AS cnt
-  FROM classified
-  WHERE NOT is_removal
-  GROUP BY day
-),
-all_days AS (
-  SELECT day FROM added
-  UNION
-  SELECT day FROM removed
-  UNION
-  SELECT day FROM change_removal_counts
-  UNION
-  SELECT day FROM change_update_counts
-)
-SELECT d.day AS date,
-       (
-         COALESCE(a.cnt, 0)
-         + COALESCE(r.cnt, 0)
-         + COALESCE(cr.cnt, 0)
-         + COALESCE(cu.cnt, 0)
-       )::int AS total_events
-FROM all_days d
-LEFT JOIN added a ON a.day = d.day
-LEFT JOIN removed r ON r.day = d.day
-LEFT JOIN change_removal_counts cr ON cr.day = d.day
-LEFT JOIN change_update_counts cu ON cu.day = d.day
-ORDER BY d.day DESC
-`
+function mergeDayCounts(
+  parts: { date: string; totalEvents: number }[][],
+): { date: string; totalEvents: number }[] {
+  const totals = new Map<string, number>()
+  for (const part of parts) {
+    for (const row of part) {
+      totals.set(row.date, (totals.get(row.date) ?? 0) + row.totalEvents)
+    }
+  }
+  return [...totals.entries()]
+    .sort(([a], [b]) => b.localeCompare(a))
+    .map(([date, totalEvents]) => ({ date, totalEvents }))
+}
 
 async function fetchDaySummaryCounts(
   fromMs: number,
 ): Promise<{ date: string; totalEvents: number }[]> {
-  const { rows } = await pool.query<{ date: string; total_events: number }>(
-    DAY_SUMMARY_COUNTS_SQL,
-    [fromMs],
-  )
-  return rows.map((row) => ({
-    date: row.date,
-    totalEvents: Number(row.total_events),
-  }))
+  const [added, removed, changes] = await Promise.all([
+    pool.query<{ date: string; total_events: number }>(
+      `SELECT ${msToDayKey('l.first_seen_at')} AS date,
+              COUNT(*)::int AS total_events
+       FROM listings l
+       WHERE l.first_seen_at >= $1
+       GROUP BY 1`,
+      [fromMs],
+    ),
+    pool.query<{ date: string; total_events: number }>(
+      `SELECT ${msToDayKey('l.removed_at')} AS date,
+              COUNT(*)::int AS total_events
+       FROM listings l
+       WHERE l.removed_at IS NOT NULL
+         AND l.removed_at >= $1
+       GROUP BY 1`,
+      [fromMs],
+    ),
+    pool.query<{ date: string; total_events: number }>(
+      `SELECT ${msToDayKey('changed_at')} AS date,
+              COALESCE(SUM(jsonb_array_length(changes)), 0)::int AS total_events
+       FROM (
+         SELECT DISTINCT ON (listing_id, changed_at, changes::text)
+                changed_at, changes
+         FROM listing_changes
+         WHERE changed_at >= $1
+         ORDER BY listing_id, changed_at, changes::text, id DESC
+       ) deduped
+       GROUP BY 1`,
+      [fromMs],
+    ),
+  ])
+
+  const mapRows = (rows: { date: string; total_events: number }[]) =>
+    rows.map((row) => ({
+      date: row.date,
+      totalEvents: Number(row.total_events),
+    }))
+
+  return mergeDayCounts([mapRows(added.rows), mapRows(removed.rows), mapRows(changes.rows)])
 }
 
 export async function getDaySummaries(days: number): Promise<{
