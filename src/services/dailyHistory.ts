@@ -454,7 +454,7 @@ async function fetchDaySummaryCounts(
     ),
     pool.query<{ date: string; total_events: number }>(
       `SELECT ${msToDayKey('changed_at')} AS date,
-              COALESCE(SUM(jsonb_array_length(changes)), 0)::int AS total_events
+              COUNT(*)::int AS total_events
        FROM listing_changes
        WHERE changed_at >= $1
        GROUP BY 1`,
