@@ -495,6 +495,201 @@ function ownerKey(ownerId?: string): string {
   return ownerId ?? UNKNOWN_OWNER_ID
 }
 
+const CHANGE_ACTION_SQL = `
+  CASE
+    WHEN (elem->>'field' = 'isRemoved' AND elem->>'to' = 'true')
+      OR (elem->>'field' = 'enrichmentStatus' AND elem->>'to' = 'removed')
+    THEN 'removed'
+    WHEN elem->>'field' = 'price'
+      OR elem->>'field' LIKE 'sourcePriceHistory%'
+    THEN 'price'
+    WHEN elem->>'field' LIKE 'imageUrls%'
+    THEN 'images'
+    WHEN elem->>'field' = 'title'
+    THEN 'title'
+    WHEN elem->>'field' = 'description'
+    THEN 'description'
+    WHEN elem->>'field' IN ('district', 'street')
+    THEN 'location'
+    ELSE 'other'
+  END
+`
+
+async function fetchDayOwnerActionRows(
+  start: number,
+  end: number,
+): Promise<OwnerDaySummary[]> {
+  const { rows } = await pool.query<{
+    owner_id: string
+    owner_name: string | null
+    owner_profile_url: string | null
+    added: number
+    removed: number
+    price: number
+    images: number
+    title: number
+    description: number
+    location: number
+    other: number
+    total: number
+  }>(
+    `
+    WITH bounds AS (
+      SELECT $1::bigint AS start_ms, $2::bigint AS end_ms
+    ),
+    removed_listings AS (
+      SELECT l.id AS listing_id
+      FROM listings l
+      CROSS JOIN bounds b
+      WHERE l.removed_at IS NOT NULL
+        AND l.removed_at BETWEEN b.start_ms AND b.end_ms
+    ),
+    deduped_changes AS (
+      SELECT DISTINCT ON (lc.listing_id, lc.changed_at, lc.changes::text)
+             lc.listing_id, lc.changes
+      FROM listing_changes lc
+      CROSS JOIN bounds b
+      WHERE lc.changed_at BETWEEN b.start_ms AND b.end_ms
+      ORDER BY lc.listing_id, lc.changed_at, lc.changes::text, lc.id DESC
+    ),
+    day_events AS (
+      SELECT COALESCE(l.owner_id, $3) AS owner_id,
+             o.name AS owner_name,
+             o.profile_url AS owner_profile_url,
+             'added'::text AS action
+      FROM listings l
+      LEFT JOIN owners o ON o.id = l.owner_id
+      CROSS JOIN bounds b
+      WHERE l.first_seen_at BETWEEN b.start_ms AND b.end_ms
+
+      UNION ALL
+
+      SELECT COALESCE(l.owner_id, $3),
+             o.name,
+             o.profile_url,
+             'removed'
+      FROM listings l
+      LEFT JOIN owners o ON o.id = l.owner_id
+      CROSS JOIN bounds b
+      WHERE l.removed_at BETWEEN b.start_ms AND b.end_ms
+
+      UNION ALL
+
+      SELECT COALESCE(l.owner_id, $3),
+             o.name,
+             o.profile_url,
+             ${CHANGE_ACTION_SQL}
+      FROM deduped_changes dc
+      JOIN listings l ON l.id = dc.listing_id
+      LEFT JOIN owners o ON o.id = l.owner_id
+      CROSS JOIN LATERAL jsonb_array_elements(dc.changes) AS elem
+      WHERE NOT (
+        (
+          (elem->>'field' = 'isRemoved' AND elem->>'to' = 'true')
+          OR (elem->>'field' = 'enrichmentStatus' AND elem->>'to' = 'removed')
+        )
+        AND EXISTS (SELECT 1 FROM removed_listings rl WHERE rl.listing_id = dc.listing_id)
+      )
+    )
+    SELECT owner_id,
+           MAX(owner_name) AS owner_name,
+           MAX(owner_profile_url) AS owner_profile_url,
+           COUNT(*) FILTER (WHERE action = 'added')::int AS added,
+           COUNT(*) FILTER (WHERE action = 'removed')::int AS removed,
+           COUNT(*) FILTER (WHERE action = 'price')::int AS price,
+           COUNT(*) FILTER (WHERE action = 'images')::int AS images,
+           COUNT(*) FILTER (WHERE action = 'title')::int AS title,
+           COUNT(*) FILTER (WHERE action = 'description')::int AS description,
+           COUNT(*) FILTER (WHERE action = 'location')::int AS location,
+           COUNT(*) FILTER (WHERE action = 'other')::int AS other,
+           COUNT(*)::int AS total
+    FROM day_events
+    GROUP BY owner_id
+    `,
+    [start, end, UNKNOWN_OWNER_ID],
+  )
+
+  const summaries: OwnerDaySummary[] = rows.map((row) => ({
+    ownerId: row.owner_id,
+    ownerName: row.owner_name ?? undefined,
+    ownerProfileUrl: row.owner_profile_url ?? undefined,
+    reputation: UNKNOWN_OWNER_REPUTATION,
+    counts: {
+      added: row.added,
+      removed: row.removed,
+      price: row.price,
+      images: row.images,
+      title: row.title,
+      description: row.description,
+      location: row.location,
+      other: row.other,
+      total: row.total,
+    },
+  }))
+
+  const reputationById = await fetchOwnerReputationMap(summaries.map((row) => row.ownerId))
+  for (const summary of summaries) {
+    summary.reputation = reputationById.get(summary.ownerId) ?? UNKNOWN_OWNER_REPUTATION
+  }
+
+  return summaries.sort((a, b) =>
+    compareOwnerReputation(
+      a.reputation,
+      b.reputation,
+      a.reputation.rating ?? 0,
+      b.reputation.rating ?? 0,
+      a.reputation.reviewCount ?? 0,
+      b.reputation.reviewCount ?? 0,
+    ),
+  )
+}
+
+function addOwnerCounts(target: OwnerActionCounts, source: OwnerActionCounts): void {
+  target.added += source.added
+  target.removed += source.removed
+  target.price += source.price
+  target.images += source.images
+  target.title += source.title
+  target.description += source.description
+  target.location += source.location
+  target.other += source.other
+  target.total += source.total
+}
+
+function buildDayActivitySummaryFromOwners(owners: OwnerDaySummary[]): DayActivitySummary {
+  const totals = emptyOwnerCounts()
+  const tierCounts = new Map<string, OwnerActionCounts>()
+  const tierOwners = new Map<string, Set<string>>()
+
+  for (const definition of REPUTATION_TIER_DEFINITIONS) {
+    tierCounts.set(definition.tier, emptyOwnerCounts())
+    tierOwners.set(definition.tier, new Set())
+  }
+
+  for (const owner of owners) {
+    const tier = reputationTierForEvent(
+      owner.ownerId === UNKNOWN_OWNER_ID ? undefined : owner.ownerId,
+      owner.reputation,
+    )
+    tierOwners.get(tier)!.add(owner.ownerId)
+    addOwnerCounts(totals, owner.counts)
+    addOwnerCounts(tierCounts.get(tier)!, owner.counts)
+  }
+
+  return {
+    totals,
+    ownerCount: owners.length,
+    byReputation: REPUTATION_TIER_DEFINITIONS.map((definition) => ({
+      tier: definition.tier,
+      label: definition.label,
+      minScore: definition.minScore,
+      maxScore: definition.maxScore,
+      ownerCount: tierOwners.get(definition.tier)!.size,
+      counts: tierCounts.get(definition.tier)!,
+    })),
+  }
+}
+
 async function fetchOwnerReputationMap(ownerIds: string[]) {
   const knownIds = ownerIds.filter((id) => id !== UNKNOWN_OWNER_ID)
   const reputationById = new Map<string, OwnerReputation>()
@@ -685,8 +880,8 @@ function paginateOwnersByActionBudget(
 
 export async function getDayActivitySummary(date: string): Promise<DayActivitySummaryPage> {
   const { start, end } = dayBounds(date)
-  const events = await collectEvents(start, end)
-  const summary = await buildDayActivitySummary(events)
+  const owners = await fetchDayOwnerActionRows(start, end)
+  const summary = buildDayActivitySummaryFromOwners(owners)
 
   return {
     date,
@@ -702,9 +897,7 @@ export async function getDayOwnerSummaries(
 ): Promise<DayOwnersPage> {
   const safeLimit = Math.min(Math.max(actionLimit, 1), 200)
   const { start, end } = dayBounds(date)
-  const events = await collectEvents(start, end)
-
-  const allOwners = await buildOwnerSummaries(events)
+  const allOwners = await fetchDayOwnerActionRows(start, end)
   const totalActions = allOwners.reduce((sum, owner) => sum + owner.counts.total, 0)
   const page = paginateOwnersByActionBudget(allOwners, actionOffset, safeLimit)
 
