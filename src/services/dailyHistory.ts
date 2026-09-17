@@ -413,30 +413,136 @@ async function collectEvents(fromMs: number, toMs?: number): Promise<HistoryEven
   return buildEventsFromRows(changeRows.rows, addedRows.rows, removedRows.rows)
 }
 
+const DAY_KEY_SQL = `to_char(to_timestamp(ms / 1000.0), 'YYYY-MM-DD')`
+
+const DAY_SUMMARY_COUNTS_SQL = `
+WITH bounds AS (
+  SELECT $1::bigint AS from_ms
+),
+added AS (
+  SELECT ${DAY_KEY_SQL.replace('ms', 'l.first_seen_at')} AS day,
+         COUNT(*)::int AS cnt
+  FROM listings l
+  CROSS JOIN bounds b
+  WHERE l.first_seen_at >= b.from_ms
+  GROUP BY 1
+),
+removed_rows AS (
+  SELECT l.id AS listing_id,
+         ${DAY_KEY_SQL.replace('ms', 'l.removed_at')} AS day
+  FROM listings l
+  CROSS JOIN bounds b
+  WHERE l.removed_at IS NOT NULL
+    AND l.removed_at >= b.from_ms
+),
+removed AS (
+  SELECT day, COUNT(*)::int AS cnt
+  FROM removed_rows
+  GROUP BY day
+),
+deduped_changes AS (
+  SELECT DISTINCT ON (lc.listing_id, lc.changed_at, lc.changes::text)
+         lc.listing_id,
+         lc.changed_at,
+         lc.changes
+  FROM listing_changes lc
+  CROSS JOIN bounds b
+  WHERE lc.changed_at >= b.from_ms
+  ORDER BY lc.listing_id, lc.changed_at, lc.changes::text, lc.id DESC
+),
+expanded AS (
+  SELECT dc.listing_id,
+         ${DAY_KEY_SQL.replace('ms', 'dc.changed_at')} AS day,
+         elem AS change
+  FROM deduped_changes dc
+  CROSS JOIN LATERAL jsonb_array_elements(dc.changes) AS elem
+),
+classified AS (
+  SELECT e.day,
+         e.listing_id,
+         (
+           (e.change->>'field' = 'isRemoved' AND e.change->>'to' = 'true')
+           OR (e.change->>'field' = 'enrichmentStatus' AND e.change->>'to' = 'removed')
+         ) AS is_removal
+  FROM expanded e
+),
+change_removals AS (
+  SELECT DISTINCT ON (day, listing_id) day, listing_id
+  FROM classified
+  WHERE is_removal
+  ORDER BY day, listing_id
+),
+change_removal_counts AS (
+  SELECT cr.day, COUNT(*)::int AS cnt
+  FROM change_removals cr
+  WHERE NOT EXISTS (
+    SELECT 1
+    FROM removed_rows rr
+    WHERE rr.listing_id = cr.listing_id
+      AND rr.day = cr.day
+  )
+  GROUP BY cr.day
+),
+change_update_counts AS (
+  SELECT day, COUNT(*)::int AS cnt
+  FROM classified
+  WHERE NOT is_removal
+  GROUP BY day
+),
+all_days AS (
+  SELECT day FROM added
+  UNION
+  SELECT day FROM removed
+  UNION
+  SELECT day FROM change_removal_counts
+  UNION
+  SELECT day FROM change_update_counts
+)
+SELECT d.day AS date,
+       (
+         COALESCE(a.cnt, 0)
+         + COALESCE(r.cnt, 0)
+         + COALESCE(cr.cnt, 0)
+         + COALESCE(cu.cnt, 0)
+       )::int AS total_events
+FROM all_days d
+LEFT JOIN added a ON a.day = d.day
+LEFT JOIN removed r ON r.day = d.day
+LEFT JOIN change_removal_counts cr ON cr.day = d.day
+LEFT JOIN change_update_counts cu ON cu.day = d.day
+ORDER BY d.day DESC
+`
+
+async function fetchDaySummaryCounts(
+  fromMs: number,
+): Promise<{ date: string; totalEvents: number }[]> {
+  const { rows } = await pool.query<{ date: string; total_events: number }>(
+    DAY_SUMMARY_COUNTS_SQL,
+    [fromMs],
+  )
+  return rows.map((row) => ({
+    date: row.date,
+    totalEvents: Number(row.total_events),
+  }))
+}
+
 export async function getDaySummaries(days: number): Promise<{
   days: DaySummary[]
   totalEvents: number
 }> {
   const safeDays = Math.min(Math.max(days, 1), 90)
   const fromMs = Date.now() - safeDays * 24 * 60 * 60 * 1000
-  const events = await collectEvents(fromMs)
+  const counts = await fetchDaySummaryCounts(fromMs)
 
-  const counts = new Map<string, number>()
-  for (const event of events) {
-    counts.set(event.date, (counts.get(event.date) ?? 0) + 1)
-  }
-
-  const daysList = [...counts.entries()]
-    .sort(([a], [b]) => b.localeCompare(a))
-    .map(([date, totalEvents]) => ({
-      date,
-      label: dayLabel(date),
-      totalEvents,
-    }))
+  const daysList = counts.map(({ date, totalEvents }) => ({
+    date,
+    label: dayLabel(date),
+    totalEvents,
+  }))
 
   return {
     days: daysList,
-    totalEvents: events.length,
+    totalEvents: counts.reduce((sum, row) => sum + row.totalEvents, 0),
   }
 }
 

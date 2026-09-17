@@ -118,6 +118,8 @@ CREATE INDEX IF NOT EXISTS idx_scrape_runs_search ON scrape_runs(search_id);
 CREATE INDEX IF NOT EXISTS idx_scrape_logs_run ON scrape_logs(run_id);
 CREATE INDEX IF NOT EXISTS idx_listing_changes_changed_at ON listing_changes(changed_at);
 CREATE INDEX IF NOT EXISTS idx_listing_changes_listing ON listing_changes(listing_id);
+CREATE INDEX IF NOT EXISTS idx_listings_first_seen_at ON listings(first_seen_at);
+CREATE INDEX IF NOT EXISTS idx_listings_removed_at ON listings(removed_at) WHERE removed_at IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS listing_image_hashes (
   listing_id TEXT NOT NULL REFERENCES listings(id) ON DELETE CASCADE,
