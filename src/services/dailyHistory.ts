@@ -495,138 +495,106 @@ function ownerKey(ownerId?: string): string {
   return ownerId ?? UNKNOWN_OWNER_ID
 }
 
-const CHANGE_ACTION_SQL = `
-  CASE
-    WHEN (elem->>'field' = 'isRemoved' AND elem->>'to' = 'true')
-      OR (elem->>'field' = 'enrichmentStatus' AND elem->>'to' = 'removed')
-    THEN 'removed'
-    WHEN elem->>'field' = 'price'
-      OR elem->>'field' LIKE 'sourcePriceHistory%'
-    THEN 'price'
-    WHEN elem->>'field' LIKE 'imageUrls%'
-    THEN 'images'
-    WHEN elem->>'field' = 'title'
-    THEN 'title'
-    WHEN elem->>'field' = 'description'
-    THEN 'description'
-    WHEN elem->>'field' IN ('district', 'street')
-    THEN 'location'
-    ELSE 'other'
-  END
-`
+type OwnerActionRow = {
+  owner_id: string
+  owner_name: string | null
+  owner_profile_url: string | null
+  count: number
+}
+
+function mergeOwnerActionRows(
+  target: Map<string, OwnerDaySummary>,
+  rows: OwnerActionRow[],
+  apply: (counts: OwnerActionCounts, count: number) => void,
+): void {
+  for (const row of rows) {
+    let summary = target.get(row.owner_id)
+    if (!summary) {
+      summary = {
+        ownerId: row.owner_id,
+        ownerName: row.owner_name ?? undefined,
+        ownerProfileUrl: row.owner_profile_url ?? undefined,
+        reputation: UNKNOWN_OWNER_REPUTATION,
+        counts: emptyOwnerCounts(),
+      }
+      target.set(row.owner_id, summary)
+    }
+    if (!summary.ownerName && row.owner_name) summary.ownerName = row.owner_name
+    if (!summary.ownerProfileUrl && row.owner_profile_url) {
+      summary.ownerProfileUrl = row.owner_profile_url
+    }
+    apply(summary.counts, row.count)
+  }
+}
+
+function finalizeOwnerSummaries(target: Map<string, OwnerDaySummary>): OwnerDaySummary[] {
+  const summaries = [...target.values()]
+  for (const summary of summaries) {
+    summary.counts.total =
+      summary.counts.added +
+      summary.counts.removed +
+      summary.counts.price +
+      summary.counts.images +
+      summary.counts.title +
+      summary.counts.description +
+      summary.counts.location +
+      summary.counts.other
+  }
+  return summaries
+}
 
 async function fetchDayOwnerActionRows(
   start: number,
   end: number,
 ): Promise<OwnerDaySummary[]> {
-  const { rows } = await pool.query<{
-    owner_id: string
-    owner_name: string | null
-    owner_profile_url: string | null
-    added: number
-    removed: number
-    price: number
-    images: number
-    title: number
-    description: number
-    location: number
-    other: number
-    total: number
-  }>(
-    `
-    WITH bounds AS (
-      SELECT $1::bigint AS start_ms, $2::bigint AS end_ms
+  const ownerSelect = `
+    COALESCE(l.owner_id, $3) AS owner_id,
+    MAX(o.name) AS owner_name,
+    MAX(o.profile_url) AS owner_profile_url,
+    COUNT(*)::int AS count
+  `
+
+  const [added, removed, updates] = await Promise.all([
+    pool.query<OwnerActionRow>(
+      `SELECT ${ownerSelect}
+       FROM listings l
+       LEFT JOIN owners o ON o.id = l.owner_id
+       WHERE l.first_seen_at BETWEEN $1 AND $2
+       GROUP BY 1`,
+      [start, end, UNKNOWN_OWNER_ID],
     ),
-    removed_listings AS (
-      SELECT l.id AS listing_id
-      FROM listings l
-      CROSS JOIN bounds b
-      WHERE l.removed_at IS NOT NULL
-        AND l.removed_at BETWEEN b.start_ms AND b.end_ms
+    pool.query<OwnerActionRow>(
+      `SELECT ${ownerSelect}
+       FROM listings l
+       LEFT JOIN owners o ON o.id = l.owner_id
+       WHERE l.removed_at IS NOT NULL
+         AND l.removed_at BETWEEN $1 AND $2
+       GROUP BY 1`,
+      [start, end, UNKNOWN_OWNER_ID],
     ),
-    deduped_changes AS (
-      SELECT DISTINCT ON (lc.listing_id, lc.changed_at, lc.changes::text)
-             lc.listing_id, lc.changes
-      FROM listing_changes lc
-      CROSS JOIN bounds b
-      WHERE lc.changed_at BETWEEN b.start_ms AND b.end_ms
-      ORDER BY lc.listing_id, lc.changed_at, lc.changes::text, lc.id DESC
+    pool.query<OwnerActionRow>(
+      `SELECT ${ownerSelect}
+       FROM listing_changes lc
+       JOIN listings l ON l.id = lc.listing_id
+       LEFT JOIN owners o ON o.id = l.owner_id
+       WHERE lc.changed_at BETWEEN $1 AND $2
+       GROUP BY 1`,
+      [start, end, UNKNOWN_OWNER_ID],
     ),
-    day_events AS (
-      SELECT COALESCE(l.owner_id, $3) AS owner_id,
-             o.name AS owner_name,
-             o.profile_url AS owner_profile_url,
-             'added'::text AS action
-      FROM listings l
-      LEFT JOIN owners o ON o.id = l.owner_id
-      CROSS JOIN bounds b
-      WHERE l.first_seen_at BETWEEN b.start_ms AND b.end_ms
+  ])
 
-      UNION ALL
+  const byOwner = new Map<string, OwnerDaySummary>()
+  mergeOwnerActionRows(byOwner, added.rows, (counts, count) => {
+    counts.added += count
+  })
+  mergeOwnerActionRows(byOwner, removed.rows, (counts, count) => {
+    counts.removed += count
+  })
+  mergeOwnerActionRows(byOwner, updates.rows, (counts, count) => {
+    counts.other += count
+  })
 
-      SELECT COALESCE(l.owner_id, $3),
-             o.name,
-             o.profile_url,
-             'removed'
-      FROM listings l
-      LEFT JOIN owners o ON o.id = l.owner_id
-      CROSS JOIN bounds b
-      WHERE l.removed_at BETWEEN b.start_ms AND b.end_ms
-
-      UNION ALL
-
-      SELECT COALESCE(l.owner_id, $3),
-             o.name,
-             o.profile_url,
-             ${CHANGE_ACTION_SQL}
-      FROM deduped_changes dc
-      JOIN listings l ON l.id = dc.listing_id
-      LEFT JOIN owners o ON o.id = l.owner_id
-      CROSS JOIN LATERAL jsonb_array_elements(dc.changes) AS elem
-      WHERE NOT (
-        (
-          (elem->>'field' = 'isRemoved' AND elem->>'to' = 'true')
-          OR (elem->>'field' = 'enrichmentStatus' AND elem->>'to' = 'removed')
-        )
-        AND EXISTS (SELECT 1 FROM removed_listings rl WHERE rl.listing_id = dc.listing_id)
-      )
-    )
-    SELECT owner_id,
-           MAX(owner_name) AS owner_name,
-           MAX(owner_profile_url) AS owner_profile_url,
-           COUNT(*) FILTER (WHERE action = 'added')::int AS added,
-           COUNT(*) FILTER (WHERE action = 'removed')::int AS removed,
-           COUNT(*) FILTER (WHERE action = 'price')::int AS price,
-           COUNT(*) FILTER (WHERE action = 'images')::int AS images,
-           COUNT(*) FILTER (WHERE action = 'title')::int AS title,
-           COUNT(*) FILTER (WHERE action = 'description')::int AS description,
-           COUNT(*) FILTER (WHERE action = 'location')::int AS location,
-           COUNT(*) FILTER (WHERE action = 'other')::int AS other,
-           COUNT(*)::int AS total
-    FROM day_events
-    GROUP BY owner_id
-    `,
-    [start, end, UNKNOWN_OWNER_ID],
-  )
-
-  const summaries: OwnerDaySummary[] = rows.map((row) => ({
-    ownerId: row.owner_id,
-    ownerName: row.owner_name ?? undefined,
-    ownerProfileUrl: row.owner_profile_url ?? undefined,
-    reputation: UNKNOWN_OWNER_REPUTATION,
-    counts: {
-      added: row.added,
-      removed: row.removed,
-      price: row.price,
-      images: row.images,
-      title: row.title,
-      description: row.description,
-      location: row.location,
-      other: row.other,
-      total: row.total,
-    },
-  }))
-
+  const summaries = finalizeOwnerSummaries(byOwner)
   const reputationById = await fetchOwnerReputationMap(summaries.map((row) => row.ownerId))
   for (const summary of summaries) {
     summary.reputation = reputationById.get(summary.ownerId) ?? UNKNOWN_OWNER_REPUTATION
